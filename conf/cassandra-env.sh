@@ -169,15 +169,22 @@ JMX_PORT="7199"
 # Here we create the arguments that will get passed to the jvm when
 # starting cassandra.
 
+# Special-case path variables for Windows.
+case "`uname`" in
+    CYGWIN*)
+        CASSANDRA_HOME=`cygpath -p -w "$CASSANDRA_HOME"`
+    ;;
+esac
+
+# add the DSE loader
+JVM_OPTS="$JVM_OPTS $DSE_OPTS $DSE_CREDENTIALS"
+
 # enable assertions.  disabling this in production will give a modest
 # performance benefit (around 5%).
 JVM_OPTS="$JVM_OPTS -ea"
 
 # add the jamm javaagent
 JVM_OPTS="$JVM_OPTS -javaagent:$CASSANDRA_HOME/lib/jamm-0.3.0.jar"
-
-# some JVMs will fill up their heap when accessed via JMX, see CASSANDRA-6541
-JVM_OPTS="$JVM_OPTS -XX:+CMSClassUnloadingEnabled"
 
 # enable thread priorities, primarily so we can give periodic tasks
 # a lower priority to avoid interfering with client workload
@@ -192,7 +199,6 @@ JVM_OPTS="$JVM_OPTS -XX:ThreadPriorityPolicy=42"
 # out.
 JVM_OPTS="$JVM_OPTS -Xms${MAX_HEAP_SIZE}"
 JVM_OPTS="$JVM_OPTS -Xmx${MAX_HEAP_SIZE}"
-JVM_OPTS="$JVM_OPTS -Xmn${HEAP_NEWSIZE}"
 JVM_OPTS="$JVM_OPTS -XX:+HeapDumpOnOutOfMemoryError"
 
 # set jvm HeapDumpPath with CASSANDRA_HEAPDUMP_DIR
@@ -206,42 +212,90 @@ startswith() { [ "${1#$2}" != "$1" ]; }
 # Per-thread stack size.
 JVM_OPTS="$JVM_OPTS -Xss256k"
 
+# Make sure all memory is faulted and zeroed on startup.
+# This helps prevent soft faults in containers and makes
+# transparent hugepage allocation more effective.
+JVM_OPTS="$JVM_OPTS -XX:+AlwaysPreTouch"
+
+# Biased locking does not benefit Cassandra.
+JVM_OPTS="$JVM_OPTS -XX:-UseBiasedLocking"
+
 # Larger interned string table, for gossip's benefit (CASSANDRA-6410)
 JVM_OPTS="$JVM_OPTS -XX:StringTableSize=1000003"
+ 
+# Enable thread-local allocation blocks and allow the JVM to automatically
+# resize them at runtime.
+JVM_OPTS="$JVM_OPTS -XX:+UseTLAB -XX:+ResizeTLAB"
 
-# GC tuning options
-JVM_OPTS="$JVM_OPTS -XX:+UseParNewGC" 
-JVM_OPTS="$JVM_OPTS -XX:+UseConcMarkSweepGC" 
-JVM_OPTS="$JVM_OPTS -XX:+CMSParallelRemarkEnabled" 
-JVM_OPTS="$JVM_OPTS -XX:SurvivorRatio=8" 
-JVM_OPTS="$JVM_OPTS -XX:MaxTenuringThreshold=1"
-JVM_OPTS="$JVM_OPTS -XX:CMSInitiatingOccupancyFraction=75"
-JVM_OPTS="$JVM_OPTS -XX:+UseCMSInitiatingOccupancyOnly"
-JVM_OPTS="$JVM_OPTS -XX:+UseTLAB"
 JVM_OPTS="$JVM_OPTS -XX:CompileCommandFile=$CASSANDRA_CONF/hotspot_compiler"
-JVM_OPTS="$JVM_OPTS -XX:CMSWaitDuration=10000"
 
-# note: bash evals '1.7.x' as > '1.7' so this is really a >= 1.7 jvm check
-if { [ "$JVM_VERSION" \> "1.7" ] && [ "$JVM_VERSION" \< "1.8.0" ] && [ "$JVM_PATCH_VERSION" -ge "60" ]; } || [ "$JVM_VERSION" \> "1.8" ] ; then
-    JVM_OPTS="$JVM_OPTS -XX:+CMSParallelInitialMarkEnabled -XX:+CMSEdenChunksRecordAlways -XX:CMSWaitDuration=10000"
+if [ "$JVM_VERSION" \< "1.8.0" ] ; then
+    ### Start CMS GC Settings
+    # Used if Java version is not 1.8+, G1GC is used for Java 1.8+.
+
+    # some JVMs will fill up their heap when accessed via JMX, see CASSANDRA-6541
+    JVM_OPTS="$JVM_OPTS -XX:+CMSClassUnloadingEnabled"
+    # CMS GC tuning options
+    JVM_OPTS="$JVM_OPTS -Xmn${HEAP_NEWSIZE}"
+    JVM_OPTS="$JVM_OPTS -XX:+UseParNewGC" 
+    JVM_OPTS="$JVM_OPTS -XX:+UseConcMarkSweepGC" 
+    JVM_OPTS="$JVM_OPTS -XX:+CMSParallelRemarkEnabled" 
+    JVM_OPTS="$JVM_OPTS -XX:SurvivorRatio=8" 
+    JVM_OPTS="$JVM_OPTS -XX:MaxTenuringThreshold=1"
+    JVM_OPTS="$JVM_OPTS -XX:CMSInitiatingOccupancyFraction=75"
+    JVM_OPTS="$JVM_OPTS -XX:+UseCMSInitiatingOccupancyOnly"
+    JVM_OPTS="$JVM_OPTS -XX:CMSWaitDuration=10000"
+
+    # note: bash evals '1.7.x' as > '1.7' so this is really a >= 1.7 jvm check
+    if { [ "$JVM_VERSION" \> "1.7" ] && [ "$JVM_VERSION" \< "1.8.0" ] && [ "$JVM_PATCH_VERSION" -ge "60" ]; } || [ "$JVM_VERSION" \> "1.8" ] ; then
+        JVM_OPTS="$JVM_OPTS -XX:+CMSParallelInitialMarkEnabled -XX:+CMSEdenChunksRecordAlways -XX:CMSWaitDuration=10000"
+    fi
+
+    if [ "$JVM_ARCH" = "64-Bit" ] ; then
+        JVM_OPTS="$JVM_OPTS -XX:+UseCondCardMark"
+    fi
+    ### End CMS GC Settings
+else # Java 1.8+
+    ### Start G1GC Settings
+    # Used when Java version is 1.8+
+    # G1GC GC tuning options
+    # Use the Hotspot garbage-first collector.
+    JVM_OPTS="$JVM_OPTS -XX:+UseG1GC"
+
+    # Have the JVM do less remembered set work during STW, instead
+    # preferring concurrent GC. Reduces p99.9 latency.
+    JVM_OPTS="$JVM_OPTS -XX:G1RSetUpdatingPauseTimePercent=5"
+
+    # Main G1GC tunable: lowering the pause target will lower throughput and vise versa.
+    # 200ms is the JVM default and lowest viable setting
+    # 1000ms increases throughput. Keep it smaller than the timeouts in cassandra.yaml.
+    JVM_OPTS="$JVM_OPTS -XX:MaxGCPauseMillis=500"
+
+    # The JVM maximum is 8 PGC threads and 1/4 of that for ConcGC.
+    # Machines with > 10 cores may need additional threads. Increase to <= full cores.
+    #JVM_OPTS="$JVM_OPTS -XX:ParallelGCThreads=16"
+    #JVM_OPTS="$JVM_OPTS -XX:ConcGCThreads=16"
+
+    # Save CPU time on large (>= 16GB) heaps by delaying region scanning
+    # until the heap is 70% full. The default in Hotspot 8u40 is 40%.
+    #JVM_OPTS="$JVM_OPTS -XX:InitiatingHeapOccupancyPercent=70"
+
+    ### End G1GC Settings
 fi
 
-if [ "$JVM_ARCH" = "64-Bit" ] ; then
-    JVM_OPTS="$JVM_OPTS -XX:+UseCondCardMark"
-fi
 
 # GC logging options -- uncomment to enable
-# JVM_OPTS="$JVM_OPTS -XX:+PrintGCDetails"
+JVM_OPTS="$JVM_OPTS -XX:+PrintGCDetails"
 # JVM_OPTS="$JVM_OPTS -XX:+PrintGCDateStamps"
 # JVM_OPTS="$JVM_OPTS -XX:+PrintHeapAtGC"
 # JVM_OPTS="$JVM_OPTS -XX:+PrintTenuringDistribution"
 # JVM_OPTS="$JVM_OPTS -XX:+PrintGCApplicationStoppedTime"
 # JVM_OPTS="$JVM_OPTS -XX:+PrintPromotionFailure"
 # JVM_OPTS="$JVM_OPTS -XX:PrintFLSStatistics=1"
-# JVM_OPTS="$JVM_OPTS -Xloggc:/var/log/cassandra/gc-`date +%s`.log"
+# JVM_OPTS="$JVM_OPTS -Xloggc:/Users/kgabriel/dse485/logs/cassandra/gc-`date +%s`.log"
 # If you are using JDK 6u34 7u2 or later you can enable GC log rotation
 # don't stick the date in the log name if rotation is on.
-# JVM_OPTS="$JVM_OPTS -Xloggc:/var/log/cassandra/gc.log"
+JVM_OPTS="$JVM_OPTS -Xloggc:/Users/kgabriel/dse485/logs/cassandra/gc.log"
 # JVM_OPTS="$JVM_OPTS -XX:+UseGCLogFileRotation"
 # JVM_OPTS="$JVM_OPTS -XX:NumberOfGCLogFiles=10"
 # JVM_OPTS="$JVM_OPTS -XX:GCLogFileSize=10M"
@@ -287,7 +341,7 @@ else
   JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.rmi.port=$JMX_PORT"
   JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.ssl=false"
   JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.authenticate=true"
-  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/jmxremote.password"
+  JVM_OPTS="$JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/dse/cassandra/jmxremote.password"
 #  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.keyStore=/path/to/keystore"
 #  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.keyStorePassword=<keystore-password>"
 #  JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStore=/path/to/truststore"
